@@ -1,25 +1,203 @@
-The MFR model is in place at
-C:\Users\e416417\AppData\Roaming\pix2text\1.1\mfr-1.5-onnx\
-with 9 files (config.json, decoder_model.onnx, encoder_model.onnx,
-generation_config.json, preprocessor_config.json, README.md,
-special_tokens_map.json, tokenizer.json, tokenizer_config.json).
-.gitattributes is intentionally absent — it's Git metadata, not a model file.
+Read MAPPING_IMPROVEMENT_PLAN.md (all sections, especially Round 8 and
+Round 9 Step 2 coverage). Also read the current `math_canonicalize.py`,
+`math_mapping.py`, and the docx extraction module. Confirm on-disk state
+before any edit. Do NOT write essays. Do NOT re-plan. Do NOT touch the
+comparison stage. Do NOT add filename special-cases. Do NOT remove or
+rewrite the Round 9 coverage JSON or temp/pix2text_fill_cache/ — they're
+evidence for later rounds.
 
-Verify:
-  dir "%APPDATA%\pix2text\1.1\mfr-1.5-onnx\"
+# STATE (established, do not re-verify)
+- Math canonicalization exists (math_canonicalize.py, canonicalize()).
+- Mapping engine exists: monotone DP + Hungarian fallback, unmapped bucket,
+  diagnostics, symbol features, position, section. All working.
+- Round 8: 103/104 NOT_IN_TOPK failures have PDF-side raw text that is a
+  placeholder token (empty canonical). Real math is missing on the PDF side.
+- Round 9 Step 2: Pix2Text loads and produces LaTeX (via pre-seeded local
+  models), but filling placeholder canonical text with Pix2Text output
+  REGRESSES mapping F1 on 3/4 hard pairs. Cause is structural:
+    * 599 / 12483 / 544: PDF tag extractor emits whole multi-equation
+      BLOCKS, docx emits single-symbol items → granularity mismatch.
+    * 1143 / 12483: docx side is MathType stubs "(MathType equation)" —
+      no reference text to match. Separate problem.
+    * canonicalize() keeps Pix2Text's $$ delimiters → adds noise.
+- Two clean root causes identified:
+    (R1) MathType docx extraction is broken (matches UAT issue #4).
+    (R2) PDF block vs docx item granularity mismatch.
+- Pix2Text wiring must stay OFF. It is a scorer in later rounds, not a
+  filler.
 
-Then run the smoke test:
-  .\.venv\Scripts\python.exe temp/round9_step1_smoke_nocert.py
+# GOAL
+Fix the two structural root causes in order. Then, and only then, upgrade
+the matcher to consider multiple PDF candidates per docx item using
+Pix2Text as ONE scoring feature among the existing features (not the sole
+decision-maker). Final mapping must improve on the 4 hard pairs without
+regressing any of the 8 pairs at F1 1.000 or any other pair by > 0.01.
 
-Print raw stdout/stderr.
+# STEP 0 — ANALYSIS PASS (do this FIRST, before any code change)
+Diagnose the 4 hard pairs at the item level so the subsequent rounds are
+targeted, not blind. Do NOT modify any code in this step. Produce a
+report only.
 
-If Pix2Text loads and produces LaTeX/MathML output → resume Round 9
-Step 2 (coverage verification on the 4 hard pairs).
+For each of these 4 pairs — 41315_2026_599, 521_2026_12483, 40998_2026_1143,
+41315_2026_544 — load the extracted items from BOTH sides (docx and pdf)
+and the ground-truth mapping. Produce, per pair:
 
-If it fails with a DIFFERENT missing filename (e.g. an MFD file under
-pix2text\1.1\mfd-1.5-onnx\) → report that exact name and path. Do not
-download, do not guess.
+  A. Item counts: docx_total, pdf_total, gt_pairs.
+  B. Docx-side classification (count + list of ids for each):
+       - "real_math": canonical text is non-empty and not a known stub
+       - "mathtype_stub": matches r'\(?MathType\s*equation\)?' or similar
+         known stub pattern
+       - "empty": canonical text is empty
+       - "other": anything else — describe in one line
+  C. PDF-side classification (count + list of ids):
+       - "real_math": canonical text non-empty
+       - "placeholder": matches r'^(inline|display)-eq-' or empty or "-"
+       - "other"
+  D. For each ground-truth pair where either side is stub / placeholder /
+     empty, note the shape:
+       - docx single-symbol vs pdf multi-equation block?  (granularity)
+       - docx stub vs pdf real math?  (MathType problem)
+       - docx real vs pdf placeholder?  (PDF extraction problem)
+       - both empty?  (both-sides extraction problem)
+     Count how many gt pairs fall into each shape, per pair.
+  E. Section-level breakdown: which sections of the docx concentrate the
+     failures? Same for PDF. This tells us whether the failure is
+     localized (a single MathType-heavy section) or spread.
+  F. Spot-check: print 5 concrete examples from the failing sets. For
+     each, show docx text, pdf text, gt ids, chosen ids, and which of
+     (D)'s shapes it matches.
 
-If it fails with a different error → report verbatim.
+Output: a compact markdown report at temp/round10_analysis.md. In the
+response, print only the classification tables (B, C, D) and the section
+breakdown (E). No prose.
 
-Keep the final response under 60 lines.
+After Step 0, decide the round order based on what the analysis shows:
+  - If mathtype_stub count > 0 on a pair, Round 10 is required for that
+    pair.
+  - If granularity mismatch count > 0 on a pair, Round 12 is required for
+    that pair.
+  - Round 11 (delimiter fix) is always safe and small — do it regardless.
+  - Round 13 only if Rounds 10-12 pass.
+
+Print the proposed round order (which round for which pair, and why, one
+line per pair). STOP. Wait for confirmation before starting Round 10.
+
+# ROUND 10 — Fix MathType docx extraction
+(only if Step 0 confirms mathtype_stub items exist)
+
+Sub-problem: docx math items whose extracted text is the literal string
+"(MathType equation)" or similar placeholder. The underlying MathType
+equation IS in the docx as an OLE object / embedded MathML payload; it's
+just not being read.
+
+Steps:
+  1. Locate the docx extraction module. Find where MathType equations are
+     being reduced to "(MathType equation)". Trace why.
+  2. Implement a MathType extraction path that pulls the real math out of
+     the docx. Acceptable sources, in order of preference:
+       a. MathML stream embedded in the OLE object (`MML` / `Equation Native`
+          stream, often `Ole10Native` or a sibling part in the docx XML).
+       b. MathType's MTEF binary → convert to MathML or LaTeX via a
+          pure-Python reader if one is available locally; if not, document
+          the fallback.
+       c. If neither is available, parse the Equation Native stream's text
+          runs if present (best-effort).
+     Do NOT add paid APIs or network calls. Use only free, local libraries
+     already in the project's dependency set, or pip-installable free ones.
+  3. New field on extracted items: `math_source` = "mathml" | "mtef" |
+     "text" | "placeholder". Placeholder items must still be emitted, but
+     flagged, so downstream can decide.
+  4. Feed the real math text through the existing canonicalize(). Do NOT
+     change canonicalize() semantics yet (see Round 11 for the $$ fix).
+  5. Add a unit test: take one docx with MathType equations from the test
+     corpus, assert extracted `math_source` != "placeholder" and canonical
+     text is non-empty for at least 80% of previously-placeholder items.
+  6. Re-run the full 16-pair harness. Acceptance:
+       - pairs identified in Step 0 as mathtype_stub-heavy must improve.
+       - No pair at F1 1.000 may drop below 1.000.
+       - No pair may drop by more than 0.01.
+     If acceptance fails, revert and report. Do NOT attempt a second fix.
+
+# ROUND 11 — Fix the $$ delimiter leak in canonicalize()
+Small, safe, orthogonal to Round 10. Do it right after Round 10 passes
+(or standalone if Step 0 shows Round 10 isn't needed).
+  - canonicalize() must strip outer delimiters: `$$...$$`, `$...$`, `\[...\]`,
+    `\(...\)`, and surrounding whitespace, before any other processing.
+  - Add a unit test with examples: `$$x$$`, `$x$`, `\[x\]`, `\(x\)` all
+    canonicalize to the same string as bare `x`.
+  - Re-run the 16-pair harness. Same acceptance rules as Round 10.
+  - If acceptance fails, revert.
+
+# ROUND 12 — Split PDF blocks into individual equations BEFORE mapping
+(only if Step 0 confirms granularity mismatch items exist)
+
+Sub-problem: PDF tag extractor emits multi-equation blocks; docx side is
+single-equation. This kills matching regardless of text quality.
+  - Identify where PDF items are built. Add a block-splitting step that runs
+    BEFORE mapping, not after.
+  - Splitting heuristics, in order (use whatever is available):
+      a. PDF tag structure — if the block contains multiple EQ> children or
+         similar, split at those boundaries.
+      b. Line breaks / vertical gaps inside the equation region using the
+         x,y coords already on each item.
+      c. Visual gap detection on the cropped region (row-wise ink density).
+  - Each split item keeps the original block's id with a suffix (`_1`,
+    `_2`, ...), inherits its coords (adjusted to the split region), and
+    keeps any nearby text / section metadata from the parent block.
+  - Add a test: for a known block containing N equations, assert N items
+    are emitted and their union of coords equals the block's coords.
+  - Re-run the 16-pair harness. Same acceptance rules.
+
+# ROUND 13 — Multi-candidate scoring with Pix2Text as ONE feature
+Only attempt this if Rounds 10-12 passed their acceptance gates.
+  - Change the candidate generation to keep top-K (K=10) PDF candidates
+    per docx item (this may already be the case; verify).
+  - For each (docx, pdf) candidate pair where the PDF item's canonical text
+    is empty OR the docx item's canonical text is empty:
+      * Crop the PDF equation region (coords are on the item).
+      * Run Pix2Text on the crop via the pre-seeded local models. Cache
+        every result to disk keyed by (file_id, pdf_item_id, coords).
+      * Add a new scoring feature: pix2text_jaccard between Pix2Text's
+        canonical text and the docx item's canonical text.
+  - Pix2Text is ONE feature. Weight it alongside existing features. Start
+    w_p2t = 0.15; tune ONCE on the 4 hard pairs only, with the acceptance
+    gate that no passing pair regresses.
+  - Run Pix2Text ONLY when at least one side of the pair has empty
+    canonical text. Non-empty pairs must not call Pix2Text at all.
+  - Cache is mandatory. Runtime increase up to ~5 min per full harness run
+    is acceptable. Beyond that, batch and re-report.
+  - Config: MATHCOMPARE_MAPPING_PIX2TEXT_FEATURE (default false in prod,
+    true in dev until validated).
+  - Acceptance on full 16-pair harness: 4 hard pairs improve; no pair at
+    1.000 drops below 1.000; no pair drops by more than 0.01.
+  - On failure: revert the feature, keep the module and cache, turn the
+    flag off, and report which pairs regressed and why.
+
+# HARD RULES
+- Step 0 is analysis-only. Do NOT modify code in Step 0.
+- One fix per round. If a round fails acceptance, revert it before
+  starting the next. Do not stack.
+- Skip a round entirely if Step 0 shows it's not needed for any pair.
+- Do NOT touch the comparison stage.
+- Do NOT change canonicalize() except in Round 11.
+- Do NOT change matcher scoring except in Round 13.
+- Do NOT add filename special-cases.
+- Do NOT add paid APIs, network calls, or ML training.
+- Do NOT delete Round 9 coverage JSON or temp/pix2text_fill_cache/.
+- If Pix2Text is invoked anywhere, use the pre-seeded local models. No
+  downloads. No cert changes. No HF calls.
+- Each round appends its own section to MAPPING_IMPROVEMENT_PLAN.md
+  ("Round 10", "Round 11", "Round 12", "Round 13"). Under 80 lines each.
+  Do not rewrite earlier sections.
+- After each round, print: files touched, key config keys added, per-pair
+  F1 before/after table, pass/revert, "Comparison stage untouched: YES."
+
+# FINAL RESPONSE SHAPE (after all rounds that pass)
+  1. Step 0 tables (B, C, D, E) + proposed round order.
+  2. Per-round result: what changed, per-pair F1 table, pass/revert.
+  3. New mean F1 across all 16 pairs vs the Round 9 baseline.
+  4. Known limitations.
+  5. "Comparison stage untouched: YES."
+
+Start with Step 0 only. Report the analysis. STOP. Wait for confirmation
+before Round 10.
