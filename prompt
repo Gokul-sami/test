@@ -1,2 +1,25 @@
-from huggingface_hub import snapshot_download
-snapshot_download(repo_id="breezedeus/pix2text-mfr-1.5", local_dir="./mfr-1.5-onnx")
+The MFR model is in place at
+C:\Users\e416417\AppData\Roaming\pix2text\1.1\mfr-1.5-onnx\
+with 9 files (config.json, decoder_model.onnx, encoder_model.onnx,
+generation_config.json, preprocessor_config.json, README.md,
+special_tokens_map.json, tokenizer.json, tokenizer_config.json).
+.gitattributes is intentionally absent — it's Git metadata, not a model file.
+
+Verify:
+  dir "%APPDATA%\pix2text\1.1\mfr-1.5-onnx\"
+
+Then run the smoke test:
+  .\.venv\Scripts\python.exe temp/round9_step1_smoke_nocert.py
+
+Print raw stdout/stderr.
+
+If Pix2Text loads and produces LaTeX/MathML output → resume Round 9
+Step 2 (coverage verification on the 4 hard pairs).
+
+If it fails with a DIFFERENT missing filename (e.g. an MFD file under
+pix2text\1.1\mfd-1.5-onnx\) → report that exact name and path. Do not
+download, do not guess.
+
+If it fails with a different error → report verbatim.
+
+Keep the final response under 60 lines.
