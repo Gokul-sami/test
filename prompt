@@ -1,19 +1,2 @@
-I have placed densenet_lite_136-gru-onnx.zip (11.6 MB) directly in
-%APPDATA%\Roaming\cnocr\2.3\ (NOT extracted, NOT renamed).
-
-Verify with:
-  dir "%APPDATA%\Roaming\cnocr\2.3\"
-
-Then run the smoke test:
-  .\.venv\Scripts\python.exe temp/round9_step1_smoke_nocert.py
-
-Print raw stdout/stderr. Do NOT attempt any network download. Do NOT
-touch cert config. Do NOT reinstall Pix2Text.
-
-If Pix2Text loads and produces LaTeX/MathML output → resume Round 9
-Step 2 (coverage verification on the 4 hard pairs).
-
-If it fails with a DIFFERENT missing filename → report that exact name,
-do not guess, do not download.
-
-Keep the final response under 60 lines.
+from huggingface_hub import snapshot_download
+snapshot_download(repo_id="breezedeus/pix2text-mfr-1.5", local_dir="./mfr-1.5-onnx")
