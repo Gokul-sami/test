@@ -1,39 +1,9 @@
-import json
-from collections import Counter
-
-def load(p):
-    with open(p) as f:
-        return [json.loads(l) for l in f if l.strip()]
-
-train = load("train.jsonl")
-test = load("test.jsonl")
-
-# 1. Check no file appears in both splits
-train_files = set(r["docx_path"].split("\\")[-1] for r in train)
-test_files  = set(r["docx_path"].split("\\")[-1] for r in test)
-print("overlap:", train_files & test_files)  # must be empty
-
-# 2. Check each row's match_score distribution — are they all high?
-scores = [r["match_score"] for r in train if "match_score" in r]
-import statistics
-print("train match_score:", min(scores), statistics.median(scores), max(scores))
-
-# 3. Check how many distinct docx_order values have a match — i.e., is
-#    every docx item represented once as a positive, or multiple times?
-from collections import defaultdict
 by_docx = defaultdict(list)
 for r in train:
-    by_docx[(r["docx_path"], r["docx_order"])].append(r["match_score"])
+    if "match_score" in r:
+        by_docx[(r["docx_path"], r["docx_order"])].append(r["match_score"])
+    else:
+        by_docx[(r["docx_path"], r["docx_order"])].append(None)
 multiples = [k for k, v in by_docx.items() if len(v) > 1]
 print(f"docx items with >1 row (multi-candidate): {len(multiples)}")
 print(f"total unique docx items: {len(by_docx)}")
-
-# 4. Print one docx item that has >1 row, full row contents
-if multiples:
-    k = multiples[0]
-    print("\nexample multi-row docx:", k)
-    for r in train:
-        if (r["docx_path"], r["docx_order"]) == k:
-            print(json.dumps({kk: r[kk] for kk in
-                ["docx_order","docx_text","pdf_order","pdf_text",
-                 "visual_score","match_score","pair_kind","matcher_source"]}, indent=2))
