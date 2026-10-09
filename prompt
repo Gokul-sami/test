@@ -1,116 +1,33 @@
-Single combined fix. Do NOT split into rounds. Do NOT write essays.
-Do NOT re-plan. Do NOT touch the comparison stage. Do NOT add filename
-special-cases. Do NOT call any network. Do NOT delete temp/round9_* or
-temp/pix2text_fill_cache/.
+import json
+from collections import Counter
 
-Read MAPPING_IMPROVEMENT_PLAN.md §Round 9 Step 2 and temp/round10_analysis.md
-first. Everything else you need is in this prompt.
+# change path to wherever your cleaned file is
+PATH = "train.jsonl"  # or whatever the file is called
+TEST_PATH = "test.jsonl"
 
-Established facts:
-- Step 0 analysis classified the 4 hard pairs:
-    599: docx all real, pdf all placeholder. Shape: 101 granularity + 22
-         docx-real-vs-pdf-placeholder.
-    12483: 73 docx MathType stubs, 106 pdf placeholders. Shape: 65
-         MathType + 30 granularity.
-    1143: 47 docx MathType stubs (100%), 46 pdf placeholders. Shape: 46
-         MathType only.
-    544: docx all real, pdf all placeholder. Shape: 53 granularity + 9
-         docx-real-vs-pdf-placeholder.
-- Existing engine: canonicalize() in math_canonicalize.py; monotone DP +
-  Hungarian + unmapped bucket in math_mapping.py. Do not touch matcher.
-- Pix2Text works locally with pre-seeded models. Do NOT wire it in this
-  round.
+def load(p):
+    with open(p) as f:
+        return [json.loads(l) for l in f if l.strip()]
 
-# FIX 1 — canonicalize() strips outer delimiters
-In math_canonicalize.py: canonicalize() must strip `$$...$$`, `$...$`,
-`\[...\]`, `\(...\)` wrappers plus surrounding whitespace BEFORE any other
-processing. Add a unit test asserting $$x$$, $x$, \[x\], \(x\) all equal
-canonicalize("x").
+train = load(PATH)
+test = load(TEST_PATH)
 
-# FIX 2 — MathType docx extraction
-In the docx extraction path (find where "(MathType equation)" is produced —
-search for that literal string):
- 1. The MathType equation is embedded in the docx as an OLE object.
-    Extract the MathML payload from inside the OLE binary.
-    Typical sources:
-      - word/embeddings/oleObject*.bin (contains "Equation Native" stream)
-      - an "MML" part in the docx package
-    Use zipfile + xml parsing to reach it. No external calls.
- 2. If MathML is present, convert it to a math string via whatever
-    MathML → LaTeX utility is already in the venv (check for
-    latex2mathml, mathml2latex, or use sympy's mathml parser). Feed the
-    result through canonicalize().
- 3. If MathML is not present but MTEF is, use a pure-Python MTEF reader
-    if one is already installed; else leave the item as placeholder and
-    set math_source="placeholder" explicitly.
- 4. Add a new field math_source ∈ {mathml, mtef, text, placeholder} on
-    every docx item.
- 5. Unit test: on a docx with MathType stubs, ≥80% of previously-stubbed
-    items must become non-placeholder.
+print("train rows:", len(train))
+print("test rows:", len(test))
 
-# FIX 3 — Split PDF multi-equation blocks into single equations
-In the PDF item-building path (find where PDF items are constructed BEFORE
-mapping):
- 1. Detect multi-equation blocks. Signals, in order:
-     - the block text/tag contains multiple equations (multiple `EQ>`
-       children, or multiple `\[...\]` / `$$...$$` spans)
-     - the block's y-extent spans multiple equation baselines
-     - the block's vertical ink profile (from its crop) has ≥2 distinct
-       dense bands separated by a gap
- 2. Split each detected block into N sub-items using:
-     - tag children if available (preferred)
-     - else vertical gap boundaries from the crop's row-wise ink density
- 3. Sub-item rules:
-     - id = parent_id + "_1", "_2", ...
-     - coords adjusted to the sub-region
-     - nearby_text, section, and all parent metadata inherited
-     - if a split boundary is ambiguous (gap < 20% of median line height),
-       do NOT split — leave as-is. Better to under-split than over-split.
- 4. Unit test: construct a fake block with N equations, assert N items
-    emitted and their union coords equals the parent block coords.
+# what files are in each
+train_files = Counter(r.get("file_id") or r.get("pair_id") or r.get("file") for r in train)
+test_files  = Counter(r.get("file_id") or r.get("pair_id") or r.get("file") for r in test)
 
-# RUN
-After fixes 1, 2, 3 are in place:
- - Run the full 16-pair harness.
- - Print a per-pair F1 table: before (from MAPPING_IMPROVEMENT_PLAN.md
-   §Round 9 or the last recorded baseline) vs after.
- - Report which of the 4 hard pairs improved and by how much.
- - If ANY pair at 1.000 dropped below 1.000, or any pair dropped by more
-   than 0.01, revert the specific fix that caused it (fix 1, 2, or 3 —
-   identify which by re-running with that fix disabled), keep the others,
-   and report.
- - Do not attempt a fourth fix.
+print("\ntrain files:")
+for k, v in train_files.items():
+    print(f"  {k}: {v}")
+print("\ntest files:")
+for k, v in test_files.items():
+    print(f"  {k}: {v}")
 
-# OUTPUT
-Append a single section "Round 10-12 combined" to
-MAPPING_IMPROVEMENT_PLAN.md (append-only, do not rewrite earlier sections),
-containing:
-  - fix 1 summary + unit test result
-  - fix 2 summary + stub→real conversion count per pair
-  - fix 3 summary + blocks split per pair
-  - full 16-pair before/after F1 table
-  - acceptance verdict
-  - "Comparison stage untouched: YES."
-Under 120 lines.
-
-Final response to me: only
-  1. Fix 1 result (1 line).
-  2. Fix 2 result: how many stubs converted per pair (1 line each).
-  3. Fix 3 result: blocks split per pair (1 line each).
-  4. Full 16-pair F1 table before/after.
-  5. Acceptance verdict: pass, or revert fix-N.
-  6. "Comparison stage untouched: YES."
-Under 80 lines. No prose.
-
-HARD RULES
-- Do not split into multiple rounds. Do all three fixes, then run once.
-- Do not modify the matcher, scoring, or weights.
-- Do not wire in Pix2Text.
-- No network calls. No cert changes.
-- If fix 2 cannot extract any MathML (older MathType, no MML stream),
-  report it and leave fix 2 as a no-op. Do NOT try alternate extraction
-  methods in this round.
-- If fix 3 over-splits (any parent splits into >8 children), tighten the
-  gap threshold and re-run once. If it still over-splits, disable fix 3
-  and report.
-- Keep the final response under 80 lines.
+# what fields does each row have
+print("\nrow keys:", sorted(train[0].keys()))
+print("\nfirst row sample:")
+for k, v in train[0].items():
+    print(f"  {k}: {repr(v)[:120]}")
