@@ -1,9 +1,160 @@
-by_docx = defaultdict(list)
-for r in train:
-    if "match_score" in r:
-        by_docx[(r["docx_path"], r["docx_order"])].append(r["match_score"])
-    else:
-        by_docx[(r["docx_path"], r["docx_order"])].append(None)
-multiples = [k for k, v in by_docx.items() if len(v) > 1]
-print(f"docx items with >1 row (multi-candidate): {len(multiples)}")
-print(f"total unique docx items: {len(by_docx)}")
+import json
+from collections import Counter, defaultdict
+
+def load(p):
+    with open(p) as f:
+        return [json.loads(l) for l in f if l.strip()]
+
+train = load("train.jsonl")
+test  = load("test.jsonl")
+
+# PDF text distribution: how many distinct PDF strings per file?
+by_file_pdf = defaultdict(set)
+for r in train + test:
+    f = r["docx_path"].split("\\")[-1]
+    by_file_pdf[f].add(r["pdf_text"])
+
+print("distinct pdf_text values per file:")
+for f, pdfs in sorted(by_file_pdf.items()):
+    print(f"  {f}: {len(pdfs)} distinct pdf_texts")
+    # sample 5
+    for s in list(pdfs)[:5]:
+        print(f"      {repr(s)}")
+
+# Same for docx_text
+by_file_docx = defaultdict(set)
+for r in train + test:
+    f = r["docx_path"].split("\\")[-1]
+    by_file_docx[f].add(r["docx_text"])
+
+print("\ndistinct docx_text values per file:")
+for f, docs in sorted(by_file_docx.items()):
+    print(f"  {f}: {len(docs)} distinct docx_texts")
+    for s in list(docs)[:3]:
+        print(f"      {repr(s)[:80]}")
+
+
+
+
+--------------------------------
+
+
+Read MAPPING_IMPROVEMENT_PLAN.md last section first. Then do EXACTLY the
+steps below. No essays. No re-planning. No comparison-stage changes.
+No filename special-cases. No ML training in this round.
+
+# GOAL
+Add a debug/dump mode to the shipped pipeline that exports the full
+candidate matrix per (docx item, PDF segment) so we can build a training
+set for a cross-encoder reranker. The dump must include, for every docx
+item, ALL PDF candidates the scorer evaluated — not just the winner.
+
+# CONTEXT
+Current pipeline: run_raw_docx_tagged_compare.py:11334
+  compare_raw_docx_to_tagged_pdf. Scoring: _compare_visual_features +
+  _context_pair_match_metadata at line 1579. Alignment: build_visual_alignment
+  at 4136, align_monotonic_segment at 3849.
+
+Existing output only records chosen pairs (comparison_pairs / merged_pairs).
+We need the rejected candidates too.
+
+# STEP 1 — Locate the scoring loop inside align_monotonic_segment
+Inside the DP (lines 3849–3938 per the reference doc), the code evaluates
+match_cost for (docx_i, pdf_j) when both are in the alignment band. Find
+that point. This is where we will capture every (i, j) that was scored.
+
+# STEP 2 — Add a candidate-capture mechanism
+ 1. Add an optional list-accumulator, e.g. scored_candidates, passed into
+    align_monotonic_segment. When None, behavior is unchanged.
+ 2. Inside the DP loop, at the point where match_metadata is computed for
+    (i, j), if scored_candidates is not None, append a record:
+        {
+          docx_order: <i's raw_order or equivalent>,
+          pdf_order: <j's tagged_order>,
+          docx_math_id: <docx item's docx_math_id>,
+          pdf_semantic_id: <pdf item's semantic_id>,
+          docx_canonical: <docx item's canonical_math_text or raw_math_text>,
+          pdf_canonical: <pdf item's actual_text>,
+          docx_family: <docx item's family>,
+          pdf_family: <pdf item's family>,
+          docx_label: <docx item's equation_label>,
+          pdf_label: <pdf item's equation_label>,
+          visual_score: <the visual component>,
+          match_score: <the effective blended score>,
+          allowed: <match_metadata["allowed"]>,
+          segment_index: <current segment>,
+          page_docx: <docx item's docx_page_number>,
+          page_pdf: <pdf item's page_number>,
+          docx_prev_text: <docx item's previous_text_token>,
+          docx_next_text: <docx item's next_text_token>,
+          pdf_before_text: <pdf item's context_before_text>,
+          pdf_after_text: <pdf item's context_after_text>,
+        }
+ 3. Thread the accumulator through the call chain from
+    compare_raw_docx_to_tagged_pdf all the way down. Only collect when
+    a module-level flag DEBUG_DUMP_CANDIDATES is True, or when a new
+    kwarg dump_candidates=True is passed to compare_raw_docx_to_tagged_pdf.
+    Default off. Existing callers unchanged.
+
+# STEP 3 — Add a CLI flag to the batch runner
+Modify scripts/run_inputs_mapping_batch.py so it accepts
+  --dump-candidates <output_dir>
+When set, for each of the 16 fixtures:
+  - runs the pipeline with dump_candidates=True
+  - writes <output_dir>/<pair_id>_candidates.jsonl
+  - one line per scored (docx, pdf) candidate pair, with the fields from Step 2
+  - also writes a header line at the top with pair_id, docx_path, pdf_path,
+    ground-truth-path if known (from tests/fixtures/mapping_pairs/<pair_id>.json)
+
+# STEP 4 — Also dump the ground truth
+For each fixture, read tests/fixtures/mapping_pairs/<pair_id>.json and
+write <output_dir>/<pair_id>_gt.json containing the expected_pairs list.
+This is what we'll use to mark candidates as positive vs negative.
+
+# STEP 5 — Run it
+Run: python scripts/run_inputs_mapping_batch.py --dump-candidates temp/cand_dump
+Report:
+  - for each pair: number of docx items, number of pdf items, number of
+    (i,j) candidate rows scored
+  - total rows across all 16 pairs
+  - which pairs produce 0 rows (if any)
+Do NOT modify the existing pipeline output. Do NOT change scoring. Do NOT
+change the matcher. This is a read-only observation mode.
+
+# STEP 6 — Verify a sample
+Open temp/cand_dump/10257_2026_743_candidates.jsonl and 41315_2026_544_candidates.jsonl.
+Confirm:
+  - multiple pdf_order values appear for the same docx_order (that is the
+    whole point — we need the rejected candidates)
+  - match_score values vary across candidates for the same docx_order
+If either file has only one row per docx_order, report that and STOP —
+the DP is only recording matches, not rejected candidates, and the
+capture point in Step 2 was wrong.
+
+# REPORTING
+Append "Round 14 — candidate dump" to MAPPING_IMPROVEMENT_PLAN.md:
+  - files touched
+  - new CLI flag
+  - per-pair row counts
+  - confirmation that multi-candidate rows exist (or not)
+  - "Comparison stage untouched: YES."
+Under 60 lines.
+
+Final response: only
+  1. files touched
+  2. per-pair row counts table
+  3. confirmation: does 10257 and 544 produce multi-candidate rows? (yes/no)
+  4. "Comparison stage untouched: YES."
+Under 40 lines.
+
+# HARD RULES
+- Do NOT change scoring weights, matcher logic, or the comparison stage.
+- Do NOT modify existing pipeline output schema.
+- Do NOT add filename special-cases.
+- Do NOT train anything.
+- Do NOT touch math_mapping.py or math_canonicalize.py.
+- The dump must be off by default; existing callers must see byte-identical
+  output to today.
+- If the DP loop doesn't evaluate (i,j) for rejected candidates (i.e., it
+  skips them before scoring), report that in the final response and STOP —
+  we'll need a different capture point.
