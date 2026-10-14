@@ -1,112 +1,24 @@
-Read MAPPING_IMPROVEMENT_PLAN.md last section (Round 16 negative result)
-first. Then do EXACTLY the steps below. No essays. No re-planning. No
-comparison-stage changes. No new pip packages. No filename special-cases.
-No ML training.
+READ-ONLY. No code changes. No essays. Answer in 15 lines.
 
-# GOAL
-Improve input quality for the docx and pdf sides so docx_canonical and
-pdf_ocr_text become semantically comparable. Verify with a jaccard
-diagnostic on 3 hard pairs (599, 544, 12483).
+Context: A previous Cline session reported pdf_ocr_text is None on all
+4422 rows of 599 in some candidates.jsonl. Earlier we verified
+cand_dump_v2 had pdf_ocr_text populated on 599. I need to know which
+file was inspected, and whether v2 still has OCR.
 
-# BACKGROUND (established)
-Jaccard between docx_canonical and pdf_ocr_text on GT pairs is median
-0.000 on 11 of 13 pairs. Two independent problems:
-  (P1) docx_canonical is truncated fragments like "Pro", "Dj" for many
-       items. The docx extractor may not be walking the full OMML tree.
-  (P2) pdf_ocr_text is noisy — e.g. "ce~measure:p~j,~and~lenthe~left~ar"
-       for a clean inline equation. The Pix2Text crop contains prose or
-       multi-line noise.
+# Steps
+1. List all candidate dumps on disk:
+     dir temp\cand_dump*
+   For each: print folder name, number of *_candidates.jsonl files,
+   and total bytes.
+2. For each dump folder, open 41315_2026_599_candidates.jsonl and count:
+     - total rows
+     - rows where pdf_ocr_text is a non-empty string
+     - rows where pdf_ocr_text is None
+   Print one line per dump: "<folder>: <total> rows, <n> with OCR, <n> without".
+3. For the most recent dump (cand_dump_v4 or cand_dump_v3, whichever
+   exists), also do the same count for 544 and 12483.
 
-# STEP 1 — Diagnose docx canonicalization (read-only first)
- 1. In run_raw_docx_tagged_compare.py, locate where the docx item's
-    canonical_math_text and raw_math_text are set (search for
-    canonical_math_text, raw_math_text around line 560–735).
- 2. Write a temporary script temp/diag_docx_canon.py that loads 599 and
-    prints for the first 20 docx items:
-      - raw_order
-      - raw_math_text (full)
-      - canonical_math_text (full)
-      - the raw OMML XML of that item, truncated to 400 chars
- 3. Run it. Report the output inline.
- 4. Based on the output, determine whether raw_math_text itself is
-    truncated (extractor bug) or whether canonicalization is dropping
-    content (canonicalizer bug).
- 5. Do NOT change any code yet. Report findings.
-
-# STOP POINT 1 — report diagnosis before fixing.
-Print:
-  - whether truncation happens at extraction or canonicalization
-  - 5 example items: raw vs canonical
-  - your proposed fix (one line)
-
-# STEP 2 — Fix whichever side is truncated
- Only proceed if Step 1 identified a truncation site. If docx extraction
- is dropping OMML content:
-   - Walk the full OMML tree (all <m:t> descendants in order) and
-     concatenate the math text runs.
-   - Re-run canonicalize() on the full string.
-   - Do NOT change anything else.
- If canonicalize() is dropping content:
-   - Fix the specific rule that drops it (identify by comparing before/
-     after in a unit-style print).
-   - Do NOT change unrelated rules.
-
-# STEP 3 — Verify Step 2
- Re-run docx extraction for 599, 544, 12483 only:
-   python scripts/run_inputs_mapping_batch.py --dump-candidates temp/cand_dump_v3 --only 41315_2026_599,41315_2026_544,521_2026_12483
- Print first 10 docx_canonical values from temp/cand_dump_v3/41315_2026_599_candidates.jsonl.
- Compare to the old ones (Pro, Dj, etc.).
- Compute jaccard(docx_canonical_new, pdf_ocr_text_old) on GT pairs.
- Report per-pair median.
-
-# STOP POINT 2 — report jaccard change before Step 4.
-
-# STEP 4 — Improve Pix2Text crops (do only if Step 3's jaccard is still < 0.15)
- 1. Open math_pdf_ocr_fill.py. Look at how the crop image is passed to
-    Pix2Text (function _pix2text_raw and its caller).
- 2. Add a preprocessing step before Pix2Text:
-      - binarize with Otsu (cv2.threshold, THRESH_OTSU)
-      - find the largest connected component of dark pixels
-      - crop to its bounding box + 4px padding
-      - pass the tight crop to Pix2Text
- 3. Bump the cache key version prefix so old cache is not reused
-    (e.g. prefix cache filenames with "v2_").
- 4. Do NOT change split logic thresholds. Do NOT change anything else.
-
-# STEP 5 — Verify Step 4
- Re-run the same 3 pairs with the new cache:
-   python scripts/run_inputs_mapping_batch.py --dump-candidates temp/cand_dump_v4 --only 41315_2026_599,41315_2026_544,521_2026_12483
- Re-compute jaccard(docx_canonical_new, pdf_ocr_text_new) on GT pairs.
- Report per-pair median.
-
-# REPORTING
-Append "Round 18 — input quality" to MAPPING_IMPROVEMENT_PLAN.md with:
-  - Step 1 diagnosis
-  - Step 2 change (file:line, one line)
-  - Step 3 jaccard table (3 pairs, before vs after Step 2)
-  - Step 4 change (file:line)
-  - Step 5 jaccard table (3 pairs, before vs after Step 4)
-  - "Comparison stage untouched: YES."
-
-Final response: only
- 1. Step 1: truncation site (extraction / canonicalization / neither)
- 2. Step 1: 5 sample items raw vs canonical
- 3. Step 2: fix applied (one line, or "none")
- 4. Step 3: jaccard table (3 pairs, before/after)
- 5. Step 4: crop fix applied (one line, or "skipped")
- 6. Step 5: jaccard table (3 pairs, before/after)
- 7. "Comparison stage untouched: YES."
-Under 60 lines.
-
-# HARD RULES
-- Do NOT change scoring, weights, DP, or comparison.
-- Do NOT touch tagged_order, item count, or pdf_items length.
-- Do NOT add new pip packages.
-- Do NOT train anything.
-- Do NOT add filename special-cases.
-- Old Pix2Text cache must remain intact (use new cache key prefix).
-- If Step 1 shows neither extraction nor canonicalization is truncating
-  (the fragments are genuine), skip Step 2 and report that.
-- If Step 4's crop preprocessing doesn't improve jaccard, revert Step 4.
-- Stop and report at STOP POINT 1 and STOP POINT 2 before proceeding.
-- Keep the final response under 60 lines.
+Answer format:
+  table of dumps with OCR coverage
+  3 lines for the most recent dump's 544 and 12483 coverage
+Under 15 lines total.
