@@ -1,207 +1,112 @@
-Read MAPPING_IMPROVEMENT_PLAN.md last two sections first. Then do EXACTLY
-the steps below. No essays. No re-planning. No comparison-stage changes.
-No filename special-cases. No ML training in this round. No new pip
-packages. All work in run_raw_docx_tagged_compare.py and its helpers,
-plus scripts/run_inputs_mapping_batch.py.
-
-# STATE (established)
-- Shipped pipeline: run_raw_docx_tagged_compare.py:11334. Scoring is
-  visual-only: _compare_visual_features (2589) blended by
-  _context_pair_match_metadata (1579). Alignment: build_visual_alignment
-  (4136), align_monotonic_segment (3849).
-- PDF side: pdf_text is a placeholder for all items
-  (inline-eq-IEq*, display-eq-Equ*, or empty). No real math text.
-- DOCX side: real math for most files. Two files
-  (40998_2026_1143, 40998_2026_1158) are 100% "(MathType equation)"
-  stubs — BUT the existing MathType OLE → PNG renderer (added earlier,
-  working) already produces images for those items. Extend it to also
-  extract text if possible.
-- Pix2Text works locally with pre-seeded models in the .venv. Venv path
-  is documented in MAPPING_IMPROVEMENT_PLAN.md.
-- Current pipeline output records only CHOSEN pairs, no rejected
-  candidates. We need a candidate dump.
-- Prior attempt at splitting PDF blocks before alignment regressed 12/16
-  pairs because it renumbered tagged_order. DO NOT do that again.
+Read MAPPING_IMPROVEMENT_PLAN.md last section (Round 16 negative result)
+first. Then do EXACTLY the steps below. No essays. No re-planning. No
+comparison-stage changes. No new pip packages. No filename special-cases.
+No ML training.
 
 # GOAL
-Produce a training-ready dataset with (a) real text on both sides, (b)
-real negatives (rejected candidates), (c) ground-truth labels. No model
-training in this round — just data generation. The cross-encoder will be
-trained in a separate Colab step from the exported JSONL.
+Improve input quality for the docx and pdf sides so docx_canonical and
+pdf_ocr_text become semantically comparable. Verify with a jaccard
+diagnostic on 3 hard pairs (599, 544, 12483).
 
-# FIX A — Pix2Text on placeholder PDF items (additive, non-invasive)
- 1. Add a new module math_pdf_ocr_fill.py at the repo root.
- 2. Public function:
-      fill_pdf_ocr_texts(pdf_items, crops_dir, cache_dir, venv_python)
-          -> pdf_items'
-    Behavior:
-      - For each pdf item whose actual_text matches r'^(inline|display)-eq-'
-        OR is empty OR equals "-":
-          * load its crop PNG (prepare_visual_assets already produces
-            these; reuse the same path map)
-          * cache key = sha1(crop_bytes). If cached in cache_dir, load.
-          * else run Pix2Text via the .venv python (subprocess or direct
-            import if safe). Output LaTeX + MathML. Canonicalize via the
-            existing canonicalize(). Write cache entry.
-          * store on the item: pdf_ocr_text (str, canonical), and
-            pdf_ocr_raw (str, raw Pix2Text output for reference).
-          * if Pix2Text fails on that item, leave pdf_ocr_text = None,
-            log a warning, never raise.
-      - Return the updated list. Non-placeholder items are unchanged.
- 3. Invoke fill_pdf_ocr_texts in compare_raw_docx_to_tagged_pdf right
-    after prepare_visual_assets, BEFORE build_visual_alignment. This
-    is a read-only enrichment: it adds fields, does not modify ids,
-    coords, tagged_order, or any existing field.
- 4. Config flag: MATHCOMPARE_PDF_OCR_FILL (default true in dev, false in
-    prod). When false, behavior is byte-identical to today.
- 5. Do NOT touch the scorer, the DP, or the refine passes. Pix2Text
-    output is only stored; it is not yet consumed.
+# BACKGROUND (established)
+Jaccard between docx_canonical and pdf_ocr_text on GT pairs is median
+0.000 on 11 of 13 pairs. Two independent problems:
+  (P1) docx_canonical is truncated fragments like "Pro", "Dj" for many
+       items. The docx extractor may not be walking the full OMML tree.
+  (P2) pdf_ocr_text is noisy — e.g. "ce~measure:p~j,~and~lenthe~left~ar"
+       for a clean inline equation. The Pix2Text crop contains prose or
+       multi-line noise.
 
-# FIX B — Visual sub-splitting on the CROP ONLY (no tagged_order change)
-The Round 9/10 attempt failed because it renumbered tagged_order. This
-time, do not touch the item list at all. Instead, enrich each placeholder
-pdf item with a list of sub-crop OCR strings.
+# STEP 1 — Diagnose docx canonicalization (read-only first)
+ 1. In run_raw_docx_tagged_compare.py, locate where the docx item's
+    canonical_math_text and raw_math_text are set (search for
+    canonical_math_text, raw_math_text around line 560–735).
+ 2. Write a temporary script temp/diag_docx_canon.py that loads 599 and
+    prints for the first 20 docx items:
+      - raw_order
+      - raw_math_text (full)
+      - canonical_math_text (full)
+      - the raw OMML XML of that item, truncated to 400 chars
+ 3. Run it. Report the output inline.
+ 4. Based on the output, determine whether raw_math_text itself is
+    truncated (extractor bug) or whether canonicalization is dropping
+    content (canonicalizer bug).
+ 5. Do NOT change any code yet. Report findings.
 
- 1. Extend math_pdf_ocr_fill.py with:
-      split_crop_and_ocr(pdf_item, crop_image, venv_python)
-          -> list[str]
-    Behavior:
-      - Grayscale, Otsu threshold.
-      - Row-wise ink profile, smoothed with 3-row box filter.
-      - Dense bands: contiguous row ranges where profile > max(3, 0.10 *
-        profile.max()).
-      - Merge adjacent bands separated by < 3% of crop height.
-      - If <= 1 band: return [pix2text(crop)].
-      - If >= 2 bands AND item height > 1.5 * median_pdf_item_height for
-        this file: for each band, crop rows [start-2, end+2], run
-        Pix2Text, canonicalize, collect.
-      - If > 6 bands: return [pix2text(crop)] (reject over-split).
-      - Return the list in top-to-bottom order.
- 2. In fill_pdf_ocr_texts, for every placeholder item, also call
-    split_crop_and_ocr and store the result as:
-      pdf_ocr_texts: list[str]  (may be length 1)
-    and store sub-bboxes as:
-      pdf_sub_bboxes: list[(y0, y1)] in page coordinates (map the row
-      ranges back via the existing crop-to-page transform).
- 3. Cache sub-split results the same way (sha1 of crop bytes + split
-    params).
- 4. Do NOT create new items. Do NOT renumber anything. Do NOT modify
-    pdf_items list length. The DP, refine passes, and output remain
-    untouched in this round.
+# STOP POINT 1 — report diagnosis before fixing.
+Print:
+  - whether truncation happens at extraction or canonicalization
+  - 5 example items: raw vs canonical
+  - your proposed fix (one line)
 
-# FIX C — MathType docx text extraction (extend existing renderer)
-The existing MathType OLE → PNG renderer (added in an earlier round)
-already produces images for MathType items. Extend it to ALSO try to
-extract text.
+# STEP 2 — Fix whichever side is truncated
+ Only proceed if Step 1 identified a truncation site. If docx extraction
+ is dropping OMML content:
+   - Walk the full OMML tree (all <m:t> descendants in order) and
+     concatenate the math text runs.
+   - Re-run canonicalize() on the full string.
+   - Do NOT change anything else.
+ If canonicalize() is dropping content:
+   - Fix the specific rule that drops it (identify by comparing before/
+     after in a unit-style print).
+   - Do NOT change unrelated rules.
 
- 1. Find the existing renderer module (it was added for the docx
-    mathtype path — search for "oleObject" or "mathml" in the docx
-    extraction area, or check MAPPING_IMPROVEMENT_PLAN.md for the file
-    name).
- 2. In addition to rendering to PNG, attempt:
-      a. MathML extraction from the OLE (the existing renderer may
-         already do this internally — reuse).
-      b. If MathML exists, convert to LaTeX (use an already-installed
-         local converter if present; if none, use sympy's mathml
-         parser or a pure-Python MathML-to-string walker).
-      c. Canonicalize via existing canonicalize().
-      d. Store on the docx item: docx_ocr_text (str, canonical),
-         docx_ocr_raw (str, pre-canonicalization).
-      e. If MathML is not present (older MTEF-only MathType), try the
-         OLE "Equation Native" stream as a best-effort text fallback;
-         if that fails, leave docx_ocr_text = None.
- 3. No new pip packages. If a required converter is missing, skip the
-    sub-case cleanly.
- 4. Do NOT touch the scoring, DP, or refine passes.
+# STEP 3 — Verify Step 2
+ Re-run docx extraction for 599, 544, 12483 only:
+   python scripts/run_inputs_mapping_batch.py --dump-candidates temp/cand_dump_v3 --only 41315_2026_599,41315_2026_544,521_2026_12483
+ Print first 10 docx_canonical values from temp/cand_dump_v3/41315_2026_599_candidates.jsonl.
+ Compare to the old ones (Pro, Dj, etc.).
+ Compute jaccard(docx_canonical_new, pdf_ocr_text_old) on GT pairs.
+ Report per-pair median.
 
-# FIX D — Candidate dump mode in the batch runner
- 1. In run_raw_docx_tagged_compare.py, add a module-level accumulator
-    that, when enabled, records every (docx_i, pdf_j) pair the DP
-    scored inside align_monotonic_segment (the same place match_cost is
-    computed; there is a gate `if not match_metadata["allowed"]` at
-    ~3937 — record the pair BEFORE that gate so rejected candidates are
-    captured too).
- 2. Each record:
-      {
-        pair_id, docx_order, pdf_order,
-        docx_canonical: docx item's canonical_math_text or raw_math_text,
-        docx_ocr_text,  # from Fix C, may be None
-        pdf_canonical: pdf item's actual_text (placeholder),
-        pdf_ocr_text,   # from Fix A, may be None
-        pdf_ocr_texts,  # from Fix B, may be None or list
-        pdf_sub_bboxes, # from Fix B
-        docx_family, pdf_family,
-        docx_label, pdf_label,
-        docx_page_number, pdf_page_number,
-        docx_prev_text, docx_next_text,
-        pdf_before_text, pdf_after_text,
-        visual_score, match_score,
-        allowed,
-        segment_index,
-        docx_position_in_segment, pdf_position_in_segment,
-        src_docx_len, src_pdf_len,  # segment sizes
-      }
- 3. Thread the accumulator through compare_raw_docx_to_tagged_pdf via
-    a kwarg dump_candidates_path=None. When None, existing behavior.
- 4. In scripts/run_inputs_mapping_batch.py, add CLI flag
-    --dump-candidates <output_dir>. When set, for each of the 16
-    fixtures:
-      - run pipeline with the accumulator enabled
-      - write <output_dir>/<pair_id>_candidates.jsonl (one line per
-        scored pair)
-      - copy the fixture's expected_pairs from
-        tests/fixtures/mapping_pairs/<pair_id>.json into
-        <output_dir>/<pair_id>_gt.json
+# STOP POINT 2 — report jaccard change before Step 4.
 
-# STEP E — Run and verify
- 1. Run:
-      python scripts/run_inputs_mapping_batch.py --dump-candidates temp/cand_dump
- 2. Verify per pair:
-      - candidates.jsonl exists, has > 1 row per docx_order (real
-        negatives, not duplicates)
-      - pdf_ocr_text is non-None on placeholder items
-      - docx_ocr_text is non-None for at least 50% of MathType docx items
-        in 1143 and 1158
- 3. If any verification fails, report exactly which pair failed and
-    which field is missing. Do NOT tune. Do NOT re-run with different
-    parameters.
+# STEP 4 — Improve Pix2Text crops (do only if Step 3's jaccard is still < 0.15)
+ 1. Open math_pdf_ocr_fill.py. Look at how the crop image is passed to
+    Pix2Text (function _pix2text_raw and its caller).
+ 2. Add a preprocessing step before Pix2Text:
+      - binarize with Otsu (cv2.threshold, THRESH_OTSU)
+      - find the largest connected component of dark pixels
+      - crop to its bounding box + 4px padding
+      - pass the tight crop to Pix2Text
+ 3. Bump the cache key version prefix so old cache is not reused
+    (e.g. prefix cache filenames with "v2_").
+ 4. Do NOT change split logic thresholds. Do NOT change anything else.
+
+# STEP 5 — Verify Step 4
+ Re-run the same 3 pairs with the new cache:
+   python scripts/run_inputs_mapping_batch.py --dump-candidates temp/cand_dump_v4 --only 41315_2026_599,41315_2026_544,521_2026_12483
+ Re-compute jaccard(docx_canonical_new, pdf_ocr_text_new) on GT pairs.
+ Report per-pair median.
 
 # REPORTING
-Append "Round 15 — OCR fill + candidate dump" to
-MAPPING_IMPROVEMENT_PLAN.md with:
-  - files touched per fix (A, B, C, D)
-  - new config flag names
-  - per-pair: candidates.jsonl row count, % of placeholder pdf items
-    with pdf_ocr_text populated, % of MathType docx items with
-    docx_ocr_text populated
-  - confirmation that existing pipeline output is unchanged when flags
-    are off
+Append "Round 18 — input quality" to MAPPING_IMPROVEMENT_PLAN.md with:
+  - Step 1 diagnosis
+  - Step 2 change (file:line, one line)
+  - Step 3 jaccard table (3 pairs, before vs after Step 2)
+  - Step 4 change (file:line)
+  - Step 5 jaccard table (3 pairs, before vs after Step 4)
   - "Comparison stage untouched: YES."
-Under 100 lines.
 
 Final response: only
- 1. Files touched per fix (A, B, C, D) — one line each.
- 2. Per-pair table: candidate rows, pdf_ocr coverage %, docx_ocr
-    coverage %.
- 3. Verification: are multi-candidate rows present? (yes/no)
- 4. Confirmation: flags-off output byte-identical to before? (yes/no)
- 5. "Comparison stage untouched: YES."
+ 1. Step 1: truncation site (extraction / canonicalization / neither)
+ 2. Step 1: 5 sample items raw vs canonical
+ 3. Step 2: fix applied (one line, or "none")
+ 4. Step 3: jaccard table (3 pairs, before/after)
+ 5. Step 4: crop fix applied (one line, or "skipped")
+ 6. Step 5: jaccard table (3 pairs, before/after)
+ 7. "Comparison stage untouched: YES."
 Under 60 lines.
 
 # HARD RULES
-- Do NOT modify tagged_order. Ever.
-- Do NOT change pdf_items list length. Ever.
-- Do NOT change the comparison stage.
-- Do NOT change existing scoring weights, matcher, or refine passes.
-- Do NOT add filename special-cases.
+- Do NOT change scoring, weights, DP, or comparison.
+- Do NOT touch tagged_order, item count, or pdf_items length.
 - Do NOT add new pip packages.
-- Do NOT train anything in this round.
-- Pix2Text calls must use the .venv python and must be cached to disk.
-- On any Pix2Text failure, log and leave the field None — never crash.
-- If MathML extraction is unavailable for a MathType item, leave
-  docx_ocr_text None and continue.
-- If Fix B produces > 6 bands on > 5% of items, disable Fix B
-  (return [pix2text(crop)]) and report.
-- If existing pipeline output changes when flags are off, that's a bug —
-  revert and report.
+- Do NOT train anything.
+- Do NOT add filename special-cases.
+- Old Pix2Text cache must remain intact (use new cache key prefix).
+- If Step 1 shows neither extraction nor canonicalization is truncating
+  (the fragments are genuine), skip Step 2 and report that.
+- If Step 4's crop preprocessing doesn't improve jaccard, revert Step 4.
+- Stop and report at STOP POINT 1 and STOP POINT 2 before proceeding.
 - Keep the final response under 60 lines.
