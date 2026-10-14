@@ -1,65 +1,147 @@
-Read MAPPING_IMPROVEMENT_PLAN.md last section (Round 18 partial: docx
-side verified clean, PDF OCR text exists but is noisy).
+READ-ONLY investigation. Do NOT modify any code. Do NOT run any
+pipeline. Do NOT commit. Do NOT create anything outside a single
+output file. No essays, no recommendations, no fixes.
 
-Task: improve Pix2Text crop quality for placeholder PDF items.
-Target pairs: 599, 544, 12483.
+# GOAL
+Produce a single reference file at the repo root named
+`PIPELINE_REFERENCE.md` that documents, with file:line evidence, exactly
+how the shipped DOCX↔PDF math mapping pipeline works as it exists on
+disk today. This becomes the source of truth for all subsequent work.
+Assume the reader has zero prior context and only this file.
 
-# STEP 1 — Inspect current crop handling (read-only first)
- 1. Open math_pdf_ocr_fill.py.
- 2. Find where the crop image is passed to Pix2Text (function _pix2text_raw
-    and its callers).
- 3. Print 20 lines around the crop-loading call — show whether any
-    preprocessing is done before Pix2Text sees the image.
- 4. Report: is there any binarization, connected-component cropping, or
-    padding removal before Pix2Text? (yes/no + line number)
+# CONTEXT
+- Project: a deterministic pipeline that maps math items from a DOCX
+  manuscript to a tagged PDF of the same paper, then compares them
+  visually.
+- There have been many rounds of changes. Documentation has drifted.
+  The plan file (MAPPING_IMPROVEMENT_PLAN.md) describes intent; the
+  actual on-disk code is the truth. This task captures the latter.
+- Known historical changes that may or may not still be present:
+  MathType OLE → PNG rendering (docx_mathtype_ole.py), Pix2Text OCR
+  fill (math_pdf_ocr_fill.py), candidate dump mode
+  (--dump-candidates in scripts/run_inputs_mapping_batch.py), a
+  reverted post-align split repair, a reverted crop preprocessing
+  step. Do NOT assume any of these are still wired in — verify each
+  one and record its status: wired / present but unused / absent.
 
-# STEP 2 — Add crop preprocessing
- If Step 1 shows no preprocessing, add a helper:
+# WHAT TO DOCUMENT
+For every section below, give: file path, function name, line number,
+one-line summary, and (where relevant) the exact signature. If
+something does not exist, write NOT_FOUND — do not guess.
 
-     def _preprocess_crop(img_bgr):
-         # grayscale
-         # Otsu threshold
-         # find largest connected component of dark pixels
-         # crop to its bbox + 4px padding
-         # return processed image
+## Section 1 — Entry points
+- The function that runs the full pipeline on a (docx, pdf) pair.
+- The CLI / batch runner entry.
+- Any watch-mode entry.
+- Where the final output (mapping result) is written on disk.
 
- Apply it immediately before _pix2text_raw is called.
- Bump the cache key version prefix (e.g. "v2_") so old cache is not reused.
+## Section 2 — Extraction
+- DOCX extraction: file:function, what it returns (field list of a
+  docx item dict), how math text is obtained (OMML tree walk? raw
+  run? canonicalization step).
+- PDF extraction: file:function, what it returns, how the tag structure
+  is walked, how placeholder ids (display-eq-Equ*, inline-eq-IEq*)
+  arise.
+- Where coordinates (x0, y0, x1, y1) on a PDF item come from — the
+  exact call that computes them.
+- Any post-extraction annotation passes (context_kinds, context
+  refresh, group ids) and what fields they add.
 
-# STEP 3 — Re-run and measure
- Run:
-   python scripts/run_inputs_mapping_batch.py --dump-candidates temp/cand_dump_v5 --only 41315_2026_599,41315_2026_544,521_2026_12483
+## Section 3 — Visual asset preparation
+- Where DOCX items are rendered to PNG (from OMML, from MathType).
+- Where PDF items are cropped to PNG.
+- The function that maps item id → PNG path.
+- Where the crops live on disk (folder name pattern).
+- Any preprocessing before crop/save (binarization, padding, size
+  checks).
 
- Compute jaccard(docx_canonical, pdf_ocr_text) on GT positive pairs for
- each of the 3 pairs. Compare against the v2 numbers:
-   599: median 0.000
-   544: median 0.000
-   12483: median 0.000
+## Section 4 — Anchoring and segmentation
+- How anchors are discovered (function names, file:line).
+- What an anchor is (label match? semantic_id match? visual?).
+- How anchors become segment boundaries in the alignment.
+- Whether anchors are all treated equally, or a confidence/tier
+  exists.
+- The exact function that cuts the two streams into segments.
 
- Report the new medians. Print 5 sample pdf_ocr_text values from v5
- for 599 to show whether the OCR looks cleaner.
+## Section 5 — Scoring
+- The pairwise score function (file:function).
+- Every feature it uses, with its weight constant name and value.
+- The blending formula for visual + context + family + label + page.
+- Any thresholds (accept floor, rescue threshold, label conflict
+  penalty, etc.).
+- Any feature that is present in code but weight-zero or disabled.
 
-# REPORTING
-Append "Round 18b — Pix2Text crop preprocessing" to
-MAPPING_IMPROVEMENT_PLAN.md with:
-  - Step 1 finding (was there preprocessing before?)
-  - Step 2 change (function added, cache key bumped)
-  - Step 3 jaccard table (3 pairs, v2 median vs v5 median)
-  - 5 sample cleaned pdf_ocr_text values
-  - "Comparison stage untouched: YES."
+## Section 6 — Assignment
+- The algorithm used (monotone DP, Hungarian, other).
+- The band / window constraint (exact constant and formula).
+- How unmapped items are produced.
+- Any post-assignment repair passes (list them in execution order,
+  with file:line).
 
-Final response: only
- 1. Step 1 finding (yes/no preprocessing before)
- 2. Step 2 change (file:line, one line)
- 3. Step 3 jaccard table (3 pairs, before/after)
- 4. 5 sample cleaned pdf_ocr_text values from 599
- 5. "Comparison stage untouched: YES."
-Under 40 lines.
+## Section 7 — Optional features — status check
+For each of the following, report WIRED / PRESENT_BUT_UNUSED / ABSENT
+with file:line evidence:
+  - MathType OLE → PNG rendering
+  - MathType OLE → text extraction
+  - Pix2Text OCR fill (pdf_ocr_text)
+  - PDF block splitting (visual or tag-based)
+  - Candidate dump mode (--dump-candidates)
+  - Cross-encoder reranking
+  - Any ML model integration
+  - Any embedding feature
+
+## Section 8 — Comparison stage (reference only, do not modify)
+- Which function consumes the mapping output for comparison.
+- Which fields of the mapping it reads.
+- Confirm whether the comparison stage reads `comparison_pairs` /
+  `alignment_pairs` or anything else.
+
+## Section 9 — Output schema
+- The exact JSON structure written per pair (keys at each level).
+- Which keys are consumed by the comparison stage and which by UAT
+  tooling.
+
+## Section 10 — Configuration
+- All env vars the shipped pipeline reads, with defaults and file:line
+  where they're read.
+- All module-level constants that affect behavior (bands, penalties,
+  thresholds), with values and file:line.
+
+## Section 11 — Tests
+- Where the mapping tests live.
+- How the batch harness discovers pairs.
+- What the fixture format is (one example shape).
+- The exact command to run the full suite.
+- The exact command to run a subset.
+
+## Section 12 — Known breakages / dead code
+- Any function that exists but is not called anywhere (grep for the
+  function name).
+- Any config flag that exists but is never read.
+- Any module that is imported but whose symbols are unused.
+- Any file touched by recent rounds that appears now to be a no-op.
+
+# OUTPUT
+Write everything to `PIPELINE_REFERENCE.md` at the repo root. Structure
+it with the 12 sections above. Each fact gets a file:line citation.
+Under 400 lines total. Use plain text, no badges, no emojis.
+
+# FINAL RESPONSE
+Only:
+  1. Confirmation PIPELINE_REFERENCE.md was written (path + line count).
+  2. Section 7 status table (the WIRED / PRESENT_BUT_UNUSED / ABSENT
+     table) — this is the most important output.
+  3. A bullet list of anything in Sections 1–6 that could NOT be
+     determined from the code (so we know what's still unclear).
+Under 40 lines. No prose, no recommendations.
 
 # HARD RULES
-- Do NOT change scoring, weights, DP, comparison.
-- Do NOT touch tagged_order or item count.
-- Do NOT add pip packages.
-- Old cache must remain intact (new prefix).
-- If Step 3's jaccard does not improve, revert Step 2 and report.
+- READ-ONLY. No code changes anywhere.
+- Do NOT write to MAPPING_IMPROVEMENT_PLAN.md.
+- Do NOT create any file other than PIPELINE_REFERENCE.md.
+- Do NOT run any pipeline, batch, or test that produces side effects
+  (no --dump-candidates, no writes to dataset.jsonl).
+- If a question in Sections 1–12 cannot be answered from the code, say
+  NOT_FOUND and move on — do not guess.
+- Citations must be real file:line, not approximate.
 - Keep the final response under 40 lines.
