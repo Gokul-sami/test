@@ -1,24 +1,65 @@
-READ-ONLY. No code changes. No essays. Answer in 15 lines.
+Read MAPPING_IMPROVEMENT_PLAN.md last section (Round 18 partial: docx
+side verified clean, PDF OCR text exists but is noisy).
 
-Context: A previous Cline session reported pdf_ocr_text is None on all
-4422 rows of 599 in some candidates.jsonl. Earlier we verified
-cand_dump_v2 had pdf_ocr_text populated on 599. I need to know which
-file was inspected, and whether v2 still has OCR.
+Task: improve Pix2Text crop quality for placeholder PDF items.
+Target pairs: 599, 544, 12483.
 
-# Steps
-1. List all candidate dumps on disk:
-     dir temp\cand_dump*
-   For each: print folder name, number of *_candidates.jsonl files,
-   and total bytes.
-2. For each dump folder, open 41315_2026_599_candidates.jsonl and count:
-     - total rows
-     - rows where pdf_ocr_text is a non-empty string
-     - rows where pdf_ocr_text is None
-   Print one line per dump: "<folder>: <total> rows, <n> with OCR, <n> without".
-3. For the most recent dump (cand_dump_v4 or cand_dump_v3, whichever
-   exists), also do the same count for 544 and 12483.
+# STEP 1 — Inspect current crop handling (read-only first)
+ 1. Open math_pdf_ocr_fill.py.
+ 2. Find where the crop image is passed to Pix2Text (function _pix2text_raw
+    and its callers).
+ 3. Print 20 lines around the crop-loading call — show whether any
+    preprocessing is done before Pix2Text sees the image.
+ 4. Report: is there any binarization, connected-component cropping, or
+    padding removal before Pix2Text? (yes/no + line number)
 
-Answer format:
-  table of dumps with OCR coverage
-  3 lines for the most recent dump's 544 and 12483 coverage
-Under 15 lines total.
+# STEP 2 — Add crop preprocessing
+ If Step 1 shows no preprocessing, add a helper:
+
+     def _preprocess_crop(img_bgr):
+         # grayscale
+         # Otsu threshold
+         # find largest connected component of dark pixels
+         # crop to its bbox + 4px padding
+         # return processed image
+
+ Apply it immediately before _pix2text_raw is called.
+ Bump the cache key version prefix (e.g. "v2_") so old cache is not reused.
+
+# STEP 3 — Re-run and measure
+ Run:
+   python scripts/run_inputs_mapping_batch.py --dump-candidates temp/cand_dump_v5 --only 41315_2026_599,41315_2026_544,521_2026_12483
+
+ Compute jaccard(docx_canonical, pdf_ocr_text) on GT positive pairs for
+ each of the 3 pairs. Compare against the v2 numbers:
+   599: median 0.000
+   544: median 0.000
+   12483: median 0.000
+
+ Report the new medians. Print 5 sample pdf_ocr_text values from v5
+ for 599 to show whether the OCR looks cleaner.
+
+# REPORTING
+Append "Round 18b — Pix2Text crop preprocessing" to
+MAPPING_IMPROVEMENT_PLAN.md with:
+  - Step 1 finding (was there preprocessing before?)
+  - Step 2 change (function added, cache key bumped)
+  - Step 3 jaccard table (3 pairs, v2 median vs v5 median)
+  - 5 sample cleaned pdf_ocr_text values
+  - "Comparison stage untouched: YES."
+
+Final response: only
+ 1. Step 1 finding (yes/no preprocessing before)
+ 2. Step 2 change (file:line, one line)
+ 3. Step 3 jaccard table (3 pairs, before/after)
+ 4. 5 sample cleaned pdf_ocr_text values from 599
+ 5. "Comparison stage untouched: YES."
+Under 40 lines.
+
+# HARD RULES
+- Do NOT change scoring, weights, DP, comparison.
+- Do NOT touch tagged_order or item count.
+- Do NOT add pip packages.
+- Old cache must remain intact (new prefix).
+- If Step 3's jaccard does not improve, revert Step 2 and report.
+- Keep the final response under 40 lines.
